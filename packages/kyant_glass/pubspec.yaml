@@ -1,0 +1,22 @@
+name: kyant_glass
+description: Flutter port of Kyant rounded rectangle refraction and edge highlights.
+repository: https://github.com/xiaomanjun233/liquid-glass-flutter
+homepage: https://github.com/xiaomanjun233/liquid-glass-flutter
+issue_tracker: https://github.com/xiaomanjun233/liquid-glass-flutter/issues
+version: 0.2.0-dev.1
+publish_to: none
+environment:
+  sdk: ^3.13.4
+dependencies:
+  flutter:
+    sdk: flutter
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+flutter:
+  shaders:
+    - shaders/kyant_lens.frag
+    - shaders/kyant_highlight.frag
+    - shaders/kyant_progressive.frag
+    - shaders/kyant_progressive_mask.frag

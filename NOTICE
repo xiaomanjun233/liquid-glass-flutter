@@ -1,0 +1,33 @@
+Kyant Glass for Flutter
+
+Original work: AndroidLiquidGlass / Backdrop by Kyant
+Copyright 2025 Kyant
+https://github.com/Kyant0/AndroidLiquidGlass
+Baseline: tag 2.0.0
+Commit: bebb11a91bd97bf1dabde479f3b332ad9898731f
+Licensed under the Apache License, Version 2.0.
+
+This repository adapts the upstream rounded-rectangle distance field, lens /
+depth / chromatic-dispersion optics, highlights, color controls, shadows, and
+Catalog Button / Toggle / Slider / BottomTabs interaction examples to Flutter.
+See docs/SOURCES.md for source-file mappings and permanent upstream links.
+The upstream baseline contains no root NOTICE file; this NOTICE records the
+attribution and modifications of the Flutter distribution.
+
+Flutter adaptations and additions
+Copyright 2026 xiaomanjun233 and contributors
+Licensed under the Apache License, Version 2.0.
+
+Modified implementation: AGSL was adapted to Flutter GLSL and sampler2D input;
+Flutter paint coordinates, GLES orientation guards, affine source transforms,
+per-surface shader ownership, ordered composed / separate filters, explicit
+background snapshots, background composition, and resource disposal were added.
+Catalog gestures were adapted to Flutter animation, pointer, keyboard, and
+semantics APIs. Rounded-corner geometry, highlight rendering, zero-dispersion
+single-sample behavior, program prewarming, and retained control shells were
+adapted or extended for the Flutter renderer.
+
+The progressive Gaussian experiments, frame recorder, diagnostics, gallery,
+tests, and Flutter background lifecycle are project additions, not features
+supplied by the upstream 2.0.0 release.
+
