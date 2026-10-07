@@ -12,7 +12,9 @@
 
 ## 背景与坐标
 
-`KyantBackdropSource` 捕获其子树，消费者在随后使用新图像，因此显式路径有捕获延迟。生产者与消费者放在兄弟分支，按顺序绘制。背景中的保留子层仅发生合成变换时，通过 `repaint` 提供驱动动画 / 滚动的 `Listenable`。
+`KyantBackdropSource` 捕获其子树，消费者在随后使用新图像，因此显式路径有捕获延迟。生产者与消费者放在兄弟分支，按顺序绘制。背景中的保留子层仅发生重绘或合成变换时，通过 `repaint` 提供驱动动画 / 滚动的 `Listenable`。这仍是显式约定：不会为了检测所有后代变化而在静止时轮询截图。
+
+背景源自身与玻璃消费者的祖先只发生保留层位移时，会检测全局变换变化。源更新捕获坐标；消费者在合成结束后请求一次重绘来更新采样映射，因此该修正仍可能延迟一帧，不是同帧采样。嵌套源构建快照时不会反向触发源捕获；尺寸、DPR、源替换与释放会更新或取消对应的捕获任务。
 
 Combined 背景按列表顺序叠加；Empty 背景提供空输入；Transformed 背景补偿 2D affine 变换。透视投影尚未实现。
 
@@ -34,6 +36,18 @@ Combined 背景按列表顺序叠加；Empty 背景提供空输入；Transformed
 | `layered` | 1–32 层高斯与连续遮罩；默认 8 层 |
 
 分层与插值通过近似换取较少滤镜组。较少层数会改变中段模糊分布；单层是固定模糊叠加透明度遮罩。可在画廊中使用细文字、条纹和动态背景比较。
+
+## Web 图像链与采样成本
+
+显式路径保留完整的效果顺序。连续的颜色、透明度和高斯效果由 `ImageFilter.compose` 合成一个输入阶段；链末尾的透镜直接绘制到消费者 Canvas，不再生成透镜输出快照。典型 `vibrancy → blur → lens` 每次缓存失效需要 **2 张局部中间图像**（裁剪输入、复合滤镜输出），原实现需要 4 张。背景源本身的共享快照另计。透镜后还有效果时仍保留中间图像，不能交换高斯与透镜的顺序。
+
+缓存键包含背景对象与版本、坐标映射、尺寸、DPR、效果参数和圆角；只改变 child 或重建等值效果列表不会丢弃缓存。这里统计的是应用层 `ui.Image` 创建次数，不等于 GPU pass 数量，也不是帧率保证。
+
+`toImageSync` 不代表零拷贝或纯 GPU。库没有调用 `toByteData`、PNG 编码或 Dart 逐像素处理，但 CanvasKit 的具体引擎版本可能在快照实现中进行 `readPixels` 与重新创建图像。应结合实际 Flutter 版本和浏览器测量，不能仅凭 Dart API 名称判断采样成本。参考 [Flutter CanvasKit picture 实现](https://github.com/flutter/flutter/blob/3.47.5/engine/src/flutter/lib/web_ui/lib/src/engine/canvaskit/picture.dart)。
+
+任意 Widget 子树仍需要在绘制后生成共享背景图像，下一帧消费，`explicitBackdropIsSameFrame` 仍为 `false`。降低 `frameInterval` 无法消除这条管线的延迟；默认已经是 `Duration.zero`。`pixelRatio` / `maxCaptureWidth` 和区域裁剪是明确的质量选项，不会自动降低画质。只需显示图片或可直接绘制的背景时，可以用显式图像 / Canvas 背景避免每帧捕获整个 Widget 树。
+
+`flutter build web --release --wasm` 可用于比较 skwasm 与 CanvasKit 的实际表现，但不会启用 Web 的 `ImageFilter.shader` 能力，也不保证快照零成本。真正的同帧任意背景纹理采样需要引擎支持或另一套渲染架构；本次修改没有引入引擎私有接口。
 
 ## 性能测量
 

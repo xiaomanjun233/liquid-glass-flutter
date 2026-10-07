@@ -12,6 +12,7 @@ import 'material.dart';
 import 'shader_backdrop.dart';
 import 'shader_uniforms.dart';
 import 'programs.dart';
+import 'transform_observer.dart';
 
 final _lensProgram = loadKyantProgram('kyant_lens.frag');
 
@@ -130,7 +131,10 @@ class _KyantGlassState extends State<KyantGlass> {
   void didUpdateWidget(KyantGlass oldWidget) {
     super.didUpdateWidget(oldWidget);
     _syncShaders();
-    _cache.clear();
+    if (oldWidget.backdrop != widget.backdrop ||
+        oldWidget.pipeline != widget.pipeline) {
+      _cache.clear();
+    }
   }
 
   @override
@@ -190,18 +194,20 @@ class _KyantGlassState extends State<KyantGlass> {
         (mode == KyantPipeline.explicit ||
             source is! KyantBackdropController ||
             !KyantGlass.supportsLiveRefraction)) {
-      material = CustomPaint(
-        painter: _ExplicitPainter(
-          source: source,
-          cache: _cache,
-          effects: effects,
-          shaders: _shaders,
-          corners: corners,
-          density: density,
-          transform: () =>
-              (context.findRenderObject()! as RenderBox).getTransformTo(null),
+      material = KyantTransformObserver(
+        child: CustomPaint(
+          painter: _ExplicitPainter(
+            source: source,
+            cache: _cache,
+            effects: effects,
+            shaders: _shaders,
+            corners: corners,
+            density: density,
+            transform: () =>
+                (context.findRenderObject()! as RenderBox).getTransformTo(null),
+          ),
+          child: ColoredBox(color: widget.tint, child: widget.child),
         ),
-        child: ColoredBox(color: widget.tint, child: widget.child),
       );
     } else {
       ui.ImageFilter? compose() {
@@ -341,6 +347,8 @@ class _ExplicitCache {
   List<double>? transform;
   Size size = Size.zero;
   double padding = 0;
+  KyantBackdrop? source;
+  List<Object?>? material;
   void clear() {
     if (image != null) _release(image!);
     image = null;
@@ -368,11 +376,50 @@ class _ExplicitPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final input = source.image;
-    if (input == null || size.isEmpty) return;
+    if (input == null || size.isEmpty) {
+      cache.clear();
+      return;
+    }
     final target = transform();
     if (target.determinant().abs() < 1e-10) return;
     final mapping = Matrix4.inverted(target)..multiply(source.imageToGlobal);
+    // Value keys survive ordinary parent rebuilds, while material, source and
+    // device-density changes still invalidate all baked intermediates.
+    final material = <Object?>[
+      density,
+      corners,
+      shaders.length,
+      for (final effect in effects)
+        ...switch (effect) {
+          KyantBlur(:final sigma) => [KyantBlur, sigma],
+          KyantColorFilter(:final filter) => [KyantColorFilter, filter],
+          KyantColorControls(
+            :final brightness,
+            :final contrast,
+            :final saturation,
+          ) =>
+            [KyantColorControls, brightness, contrast, saturation],
+          KyantOpacity(:final alpha) => [KyantOpacity, alpha],
+          KyantLens(
+            :final height,
+            :final amount,
+            :final dispersion,
+            :final depth,
+          ) =>
+            [KyantLens, height, amount, dispersion, depth],
+        },
+    ];
+    // A terminal lens can draw directly into the destination. Only lenses that
+    // feed another effect need their own image. Preserve arbitrary effect order.
+    final terminalLens =
+        effects.isNotEmpty &&
+            effects.last is KyantLens &&
+            shaders.length == effects.whereType<KyantLens>().length
+        ? effects.last as KyantLens
+        : null;
     if (cache.image == null ||
+        !identical(cache.source, source) ||
+        !listEquals(cache.material, material) ||
         cache.revision != source.revision ||
         cache.size != size ||
         !listEquals(cache.transform, mapping.storage)) {
@@ -411,51 +458,67 @@ class _ExplicitPainter extends CustomPainter {
         );
       });
       var lensIndex = 0;
-      for (final effect in effects) {
+      ui.ImageFilter? pendingFilter;
+      void flushFilters() {
+        final filter = pendingFilter;
+        if (filter == null) return;
         final previous = image;
-        if (effect is KyantLens) {
-          if (lensIndex >= shaders.length) continue;
-          final shader = shaders[lensIndex++];
-          final sample = Matrix4.identity()
-            ..translateByDouble(padding * density, padding * density, 0, 1)
-            ..scaleByDouble(density, density, 1, 1);
-          bindKyantLens(
-            shader,
-            size: size,
-            corners: corners,
-            lens: effect,
-            localToTexture: sample,
-            sourceSize: Size(width.toDouble(), height.toDouble()),
-            filterInput: false,
+        image = record(
+          (c) =>
+              c.drawImage(previous, Offset.zero, Paint()..imageFilter = filter),
+        );
+        _release(previous);
+        pendingFilter = null;
+      }
+
+      for (var index = 0; index < effects.length; index++) {
+        final effect = effects[index];
+        if (effect is! KyantLens) {
+          // Compose contiguous basic filters in the declared order. Creating
+          // one ui.Image per color/opacity/blur stage is costly on Flutter Web.
+          pendingFilter = kyantCompose(
+            pendingFilter,
+            kyantBasicFilter(effect, scale: density),
           );
-          shader.setImageSampler(0, previous);
-          image = record((c) {
-            c.scale(density);
-            c.translate(padding, padding);
-            c.drawRect(
-              Rect.fromLTWH(
-                -padding,
-                -padding,
-                width / density,
-                height / density,
-              ),
-              Paint()..shader = shader,
-            );
-          });
-        } else {
-          final filter = kyantBasicFilter(effect, scale: density);
-          if (filter == null) continue;
-          image = record(
-            (c) => c.drawImage(
-              previous,
-              Offset.zero,
-              Paint()..imageFilter = filter,
-            ),
-          );
+          continue;
         }
+        flushFilters();
+        if (lensIndex >= shaders.length) continue;
+        final shader = shaders[lensIndex++];
+        if (index == effects.length - 1 && terminalLens != null) break;
+        final previous = image;
+        final sample = Matrix4.identity()
+          ..translateByDouble(padding * density, padding * density, 0, 1)
+          ..scaleByDouble(density, density, 1, 1);
+        bindKyantLens(
+          shader,
+          size: size,
+          corners: corners,
+          lens: effect,
+          localToTexture: sample,
+          sourceSize: Size(width.toDouble(), height.toDouble()),
+          filterInput: false,
+        );
+        shader.setImageSampler(0, previous);
+        image = record((c) {
+          c.scale(density);
+          c.translate(padding, padding);
+          c.drawRect(
+            Rect.fromLTWH(
+              -padding,
+              -padding,
+              width / density,
+              height / density,
+            ),
+            Paint()..shader = shader,
+          );
+        });
         _release(previous);
       }
+      flushFilters();
       cache.image = image;
+      cache.source = source;
+      cache.material = material;
       cache.padding = padding;
       cache.size = size;
       cache.revision = source.revision;
@@ -463,6 +526,26 @@ class _ExplicitPainter extends CustomPainter {
     }
     KyantDiagnostics.explicitPaints++;
     final pad = cache.padding;
+    if (terminalLens != null) {
+      final shader = shaders.last;
+      bindKyantLens(
+        shader,
+        size: size,
+        corners: corners,
+        lens: terminalLens,
+        localToTexture: Matrix4.identity()
+          ..translateByDouble(pad * density, pad * density, 0, 1)
+          ..scaleByDouble(density, density, 1, 1),
+        sourceSize: Size(
+          cache.image!.width.toDouble(),
+          cache.image!.height.toDouble(),
+        ),
+        filterInput: false,
+      );
+      shader.setImageSampler(0, cache.image!);
+      canvas.drawRect(Offset.zero & size, Paint()..shader = shader);
+      return;
+    }
     canvas.drawImageRect(
       cache.image!,
       Rect.fromLTWH(
