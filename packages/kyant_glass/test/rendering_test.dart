@@ -175,6 +175,52 @@ void main() {
       image.dispose();
     },
   );
+  testWidgets('retained moving glass resamples a static background', (
+    tester,
+  ) async {
+    final image = (await tester.runAsync(quadrants))!;
+    await tester.runAsync(KyantGlass.precache);
+    final source = _ImageSource(image);
+    final offset = ValueNotifier(Offset.zero);
+    final key = GlobalKey();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Align(
+          alignment: Alignment.topLeft,
+          child: ValueListenableBuilder<Offset>(
+            valueListenable: offset,
+            builder: (_, value, child) =>
+                Transform.translate(offset: value, child: child),
+            child: RepaintBoundary(
+              key: key,
+              child: SizedBox.square(
+                dimension: 80,
+                child: KyantGlass(
+                  backdrop: source,
+                  pipeline: KyantPipeline.explicit,
+                  radius: 0,
+                  highlight: 0,
+                  tint: Colors.transparent,
+                  effects: const [KyantLens(height: 0, amount: 0)],
+                  child: const SizedBox.expand(),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(rgba(await pixels(tester, key), 10, 10), [244, 67, 54, 255]);
+    offset.value = const Offset(40, 0);
+    await tester.pumpAndSettle();
+    expect(rgba(await pixels(tester, key), 10, 10), [76, 175, 80, 255]);
+    await tester.pumpWidget(const SizedBox());
+    await tester.pump();
+    source.dispose();
+    offset.dispose();
+    image.dispose();
+  });
   testWidgets('empty background never samples the scene', (tester) async {
     final empty = KyantEmptyBackdrop();
     await tester.pumpWidget(

@@ -17,7 +17,8 @@ abstract class KyantBackdrop implements Listenable {
 
 /// An explicit underlay for renderers without ImageFilter.shader (Web).
 /// Chrome consumers are siblings of [KyantBackdropSource], never its children.
-/// Captures only the configured region; consumers never read CPU pixels.
+/// Captures only the configured region, without Dart-side pixel readback.
+/// Snapshot implementation and readback costs depend on the Flutter renderer.
 class KyantBackdropController extends ChangeNotifier implements KyantBackdrop {
   KyantBackdropController({
     this.frameInterval = Duration.zero,
@@ -53,6 +54,7 @@ class KyantBackdropController extends ChangeNotifier implements KyantBackdrop {
   bool _dirtyDuringCapture = false;
   GlobalKey? _boundary;
   Timer? _timer;
+  int _requestEpoch = 0;
   final _clock = Stopwatch()..start();
   int _lastCapture = -120;
 
@@ -67,13 +69,17 @@ class KyantBackdropController extends ChangeNotifier implements KyantBackdrop {
     }
     if (_scheduled) return;
     _scheduled = true;
+    final epoch = _requestEpoch;
     final delay = math.max(
       0,
       frameInterval.inMilliseconds -
           (_clock.elapsedMilliseconds - _lastCapture),
     );
     void schedule() {
-      WidgetsBinding.instance.addPostFrameCallback((_) => _capture());
+      _timer = null;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (epoch == _requestEpoch) _capture();
+      });
       WidgetsBinding.instance.ensureVisualUpdate();
     }
 
@@ -86,13 +92,38 @@ class KyantBackdropController extends ChangeNotifier implements KyantBackdrop {
     }
   }
 
+  void _detach(GlobalKey boundary) {
+    if (!identical(_boundary, boundary)) return;
+    _boundary = null;
+    _requestEpoch++;
+    _timer?.cancel();
+    _timer = null;
+    _scheduled = false;
+    _dirtyDuringCapture = false;
+  }
+
   Future<void> _capture() async {
     _scheduled = false;
-    if (_disposed || _capturing) return;
+    if ((!kIsWeb && !captureOnNative) || _disposed || _capturing) return;
     final boundary = _boundary?.currentContext?.findRenderObject();
     if (boundary is! _BackdropBoundary ||
         !boundary.attached ||
-        boundary.size.isEmpty) {
+        !boundary.canCapture) {
+      return;
+    }
+    if (boundary.size.isEmpty) {
+      final previous = _image;
+      _image = null;
+      _rect = Rect.zero;
+      _imageToGlobal = Matrix4.identity();
+      if (previous != null) {
+        revision++;
+        notifyListeners();
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          previous.dispose();
+          KyantDiagnostics.imageDisposed();
+        });
+      }
       return;
     }
     _capturing = true;
@@ -106,8 +137,11 @@ class KyantBackdropController extends ChangeNotifier implements KyantBackdrop {
           ? 0.0
           : boundary.size.height - height;
       final region = Rect.fromLTWH(0, top, boundary.size.width, height);
+      final context = _boundary!.currentContext!;
       final requestedRatio =
-          pixelRatio ?? View.of(_boundary!.currentContext!).devicePixelRatio;
+          pixelRatio ??
+          MediaQuery.maybeDevicePixelRatioOf(context) ??
+          View.of(context).devicePixelRatio;
       final ratio = maxCaptureWidth == null
           ? requestedRatio
           : math.min(requestedRatio, maxCaptureWidth! / boundary.size.width);
@@ -146,6 +180,8 @@ class KyantBackdropController extends ChangeNotifier implements KyantBackdrop {
   @override
   void dispose() {
     _disposed = true;
+    _requestEpoch++;
+    _boundary = null;
     _timer?.cancel();
     _image?.dispose();
     if (_image != null) KyantDiagnostics.imageDisposed();
@@ -188,6 +224,9 @@ class _KyantBackdropSourceState extends State<KyantBackdropSource> {
   @override
   void didUpdateWidget(KyantBackdropSource old) {
     super.didUpdateWidget(old);
+    if (old.controller != widget.controller) {
+      old.controller._detach(_boundary);
+    }
     if (old.repaint != widget.repaint) {
       old.repaint?.removeListener(_invalidate);
       widget.repaint?.addListener(_invalidate);
@@ -196,32 +235,41 @@ class _KyantBackdropSourceState extends State<KyantBackdropSource> {
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _invalidate();
+  }
+
+  @override
   void dispose() {
     widget.repaint?.removeListener(_invalidate);
+    widget.controller._detach(_boundary);
     super.dispose();
   }
 
   @override
-  Widget build(BuildContext context) =>
-      NotificationListener<ScrollNotification>(
-        onNotification: (_) {
-          widget.controller.request(_boundary);
-          return false;
-        },
-        child: _ProducerDomain(
-          sources: [
-            ...KyantBackdropSource.producersOf(context),
-            widget.controller,
-          ],
-          child: _BackdropRepaintBoundary(
-            key: _boundary,
-            child: _PaintObserver(
-              onPaint: () => widget.controller.request(_boundary),
-              child: widget.child,
-            ),
-          ),
+  Widget build(BuildContext context) {
+    // View.of does not subscribe to metric changes. Retained content still
+    // needs a new physical-density snapshot when its MediaQuery DPR changes.
+    MediaQuery.maybeDevicePixelRatioOf(context);
+    return NotificationListener<ScrollNotification>(
+      onNotification: (_) {
+        widget.controller.request(_boundary);
+        return false;
+      },
+      child: _ProducerDomain(
+        sources: [
+          ...KyantBackdropSource.producersOf(context),
+          widget.controller,
+        ],
+        child: _BackdropRepaintBoundary(
+          key: _boundary,
+          onCapture: _invalidate,
+          child: widget.child,
         ),
-      );
+      ),
+    );
+  }
 }
 
 class _ProducerDomain extends InheritedWidget {
@@ -232,17 +280,82 @@ class _ProducerDomain extends InheritedWidget {
       !listEquals(sources, old.sources);
 }
 
-/// The boundary owns its layer and exposes a cropped GPU snapshot without
+/// The boundary owns its layer and exposes a cropped image snapshot without
 /// calling protected RenderObject members from a controller.
 class _BackdropRepaintBoundary extends SingleChildRenderObjectWidget {
-  const _BackdropRepaintBoundary({super.key, required super.child});
+  const _BackdropRepaintBoundary({
+    super.key,
+    required this.onCapture,
+    required super.child,
+  });
+  final VoidCallback onCapture;
   @override
-  RenderObject createRenderObject(BuildContext context) => _BackdropBoundary();
+  RenderObject createRenderObject(BuildContext context) =>
+      _BackdropBoundary(onCapture);
+  @override
+  void updateRenderObject(
+    BuildContext context,
+    _BackdropBoundary renderObject,
+  ) {
+    renderObject.onCapture = onCapture;
+  }
 }
 
 class _BackdropBoundary extends RenderRepaintBoundary {
-  ui.Image capture(Rect region, double pixelRatio) =>
-      (layer! as OffsetLayer).toImageSync(region, pixelRatio: pixelRatio);
+  _BackdropBoundary(this.onCapture);
+  VoidCallback onCapture;
+  VoidCallback? _removeCompositionCallback;
+  List<double>? _lastTransform;
+
+  // A source snapshot assembles a scene too, including nested source layers.
+  // None of those callbacks may enqueue another capture of that same scene.
+  static int _snapshotDepth = 0;
+
+  bool get canCapture => hasSize && layer is OffsetLayer && layer!.attached;
+
+  @override
+  void paint(PaintingContext context, Offset offset) {
+    super.paint(context, offset);
+    _lastTransform = List.of(getTransformTo(null).storage);
+    onCapture();
+  }
+
+  void _didComposite(Layer observedLayer) {
+    if (_snapshotDepth != 0 || !attached || !observedLayer.attached) return;
+    final transform = getTransformTo(null).storage;
+    if (listEquals(_lastTransform, transform)) return;
+    _lastTransform = List.of(transform);
+    onCapture();
+  }
+
+  @override
+  OffsetLayer updateCompositedLayer({
+    required covariant OffsetLayer? oldLayer,
+  }) {
+    if (oldLayer != null) return oldLayer;
+    final next = OffsetLayer();
+    _removeCompositionCallback = next.addCompositionCallback(_didComposite);
+    return next;
+  }
+
+  ui.Image capture(Rect region, double pixelRatio) {
+    _snapshotDepth++;
+    try {
+      return (layer! as OffsetLayer).toImageSync(
+        region,
+        pixelRatio: pixelRatio,
+      );
+    } finally {
+      _snapshotDepth--;
+    }
+  }
+
+  @override
+  void dispose() {
+    _removeCompositionCallback?.call();
+    _removeCompositionCallback = null;
+    super.dispose();
+  }
 }
 
 /// Place only the consumers in this scope, beside their backdrop source.
@@ -259,25 +372,4 @@ class KyantBackdropScope extends InheritedWidget {
   @override
   bool updateShouldNotify(KyantBackdropScope oldWidget) =>
       oldWidget.controller != controller;
-}
-
-class _PaintObserver extends SingleChildRenderObjectWidget {
-  const _PaintObserver({required this.onPaint, required super.child});
-  final VoidCallback onPaint;
-  @override
-  RenderObject createRenderObject(BuildContext context) =>
-      _ObservePaint(onPaint);
-  @override
-  void updateRenderObject(BuildContext context, _ObservePaint renderObject) =>
-      renderObject.onPaint = onPaint;
-}
-
-class _ObservePaint extends RenderProxyBox {
-  _ObservePaint(this.onPaint);
-  VoidCallback onPaint;
-  @override
-  void paint(PaintingContext context, Offset offset) {
-    super.paint(context, offset);
-    onPaint();
-  }
 }
